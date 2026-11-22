@@ -1,0 +1,150 @@
+#include "/Engine/Private/Common.ush"
+
+// Editor診断では同じ材質へ通常のラスタライズ補間を渡し、候補の入力計算と切り分ける。
+#if COVERAGE_RASTER_PROBE
+struct FCoverageRasterInterpolants
+{
+    INVARIANT_OUTPUT float4 Position : SV_Position;
+    float3 WorldPosition : TEXCOORD0;
+    float3 VertexNormal : TEXCOORD1;
+    float2 UV : TEXCOORD2;
+};
+#endif
+
+#if COVERAGE_VERTEX_SHADER
+#if COVERAGE_RASTER_PROBE
+Buffer<float4> CoverageSamples;
+void MainVS(uint VertexId : SV_VertexID, out FCoverageRasterInterpolants Output)
+{
+    ResolvedView = ResolveView();
+    // 標準Local VFと同じ順序で原点移動する。CPUで減算済みの値は丸め位置が異なる。
+    const float3 LocalPosition = CoverageSamples[VertexId * 4].xyz;
+    const float4 WorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition,
+        DFPromote(float4x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)), ResolvedView.PreViewTranslation);
+    Output.WorldPosition = WorldPosition.xyz;
+    Output.VertexNormal = CoverageSamples[VertexId * 4 + 1].xyz;
+    Output.UV = CoverageSamples[VertexId * 4 + 2].xy;
+    Output.Position = INVARIANT(mul(WorldPosition, ResolvedView.TranslatedWorldToClip));
+}
+#else
+void MainVS(uint VertexId : SV_VertexID, out float4 Position : SV_Position)
+{
+    const float2 UV = float2((VertexId << 1) & 2, VertexId & 2);
+    Position = float4(UV * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+#endif
+#else
+#include "/Engine/Generated/Material.ush"
+
+Buffer<float4> CoverageSamples;
+uint CoverageCount;
+uint CoverageSlot;
+uint CoverageWidth;
+#if COVERAGE_PROBE_MODE == 0
+RWTexture2D<float> CoverageOutput;
+#elif COVERAGE_PROBE_MODE == 3
+RWTexture2D<float4> CoverageDetails;
+#endif
+#if COVERAGE_PROBE_MODE == 2
+RWBuffer<float4> RasterSamples;
+#endif
+
+#if COVERAGE_RASTER_PROBE
+void MainPS(FCoverageRasterInterpolants Raster, uint PrimitiveId : SV_PrimitiveID, out float4 OutCoverage : SV_Target0)
+#else
+void MainPS(float4 SvPosition : SV_Position)
+#endif
+{
+#if COVERAGE_RASTER_PROBE
+    const float4 SvPosition = Raster.Position;
+    const float4 PositionAndSlot = float4(Raster.WorldPosition, 0);
+    const float3 N = normalize(Raster.VertexNormal);
+    const float4 UV = float4(Raster.UV, ddx(Raster.UV));
+    const float2 Ddy = ddy(Raster.UV);
+#else
+    // 候補ごとに2x2を評価し、SampleBiasをSampleGradへの置換なしで実行する。
+    // 補助画素も同じ候補を読むので、隣接する候補のUVが微分へ混ざらない。
+    const uint2 OutputPixel = uint2(SvPosition.xy) / 2;
+    const uint2 Lane = uint2(SvPosition.xy) & 1;
+    const uint Index = OutputPixel.y * CoverageWidth + OutputPixel.x;
+    if (Index >= CoverageCount)
+    {
+        discard;
+    }
+    const float4 PositionAndSlot = CoverageSamples[Index * 4];
+    // 無効Slotの-1をuintへ変換すると0に丸められるRHIがある。符号を保って比較する。
+    if (PositionAndSlot.w != float(CoverageSlot))
+    {
+        discard;
+    }
+    const float3 N = normalize(CoverageSamples[Index * 4 + 1].xyz);
+    float4 UV = CoverageSamples[Index * 4 + 2];
+    const float2 Ddy = CoverageSamples[Index * 4 + 3].xy;
+    UV.xy += float(Lane.x) * UV.zw + float(Lane.y) * Ddy;
+#endif
+
+    ResolvedView = ResolveView();
+    FMaterialPixelParameters Parameters = MakeInitializedMaterialPixelParameters();
+    const float3 T = normalize(cross(abs(N.z) < 0.99 ? float3(0, 0, 1) : float3(0, 1, 0), N));
+    Parameters.TangentToWorld = float3x3(T, cross(N, T), N);
+#if USE_WORLDVERTEXNORMAL_CENTER_INTERPOLATION
+    Parameters.WorldVertexNormal_Center = N;
+#endif
+    Parameters.VertexColor = 1;
+#if NUM_TEX_COORD_INTERPOLATORS
+    Parameters.TexCoords[0] = UV.xy;
+    Parameters.TexCoords_DDX[0] = UV.zw;
+    Parameters.TexCoords_DDY[0] = Ddy;
+#endif
+
+    // 元材のCameraVector、品質分岐、Texture Sample、Clip値をそのまま使う。
+    // このパスの対象はUV0・頂点法線・CameraVectorで評価できるMaskに限定する。
+    FPixelMaterialInputs Inputs = (FPixelMaterialInputs)0;
+    const float4 ScreenPosition = mul(float4(PositionAndSlot.xyz, 1), ResolvedView.TranslatedWorldToClip);
+    CalcMaterialParametersEx(Parameters, Inputs, SvPosition, ScreenPosition, true,
+        PositionAndSlot.xyz, PositionAndSlot.xyz);
+    const float Mask = GetMaterialMaskInputRaw(Inputs);
+
+    // 実際の描画画素でUE標準のディザを評価する。候補Texture上の配置を画面座標に使わない。
+    float2 Pixel = (ScreenPosition.xy / ScreenPosition.w * float2(0.5, -0.5) + 0.5) *
+        ResolvedView.ViewSizeAndInvSize.xy + ResolvedView.ViewRectMin.xy;
+    // 投影不能な点には対応する描画画素がない。候補の固定位置で同じノイズ分布を標本化する。
+    if (all(isfinite(Pixel)) == false)
+    {
+#if COVERAGE_RASTER_PROBE
+        Pixel = SvPosition.xy;
+#else
+        Pixel = float2(OutputPixel) + 0.5;
+#endif
+    }
+#if MATERIAL_DITHER_OPACITY_MASK
+    // 負の画面座標もノイズ周期へ戻してから整数化し、符号なし変換の飽和を避ける。
+    Pixel = floor(frac(Pixel / float2(View.BlueNoiseDimensions.xy)) * float2(View.BlueNoiseDimensions.xy));
+#endif
+    const float Clipped = GetDitheredMaterialMask(Inputs, uint2(Pixel), View.StateFrameIndex);
+#if COVERAGE_PROBE_MODE == 0
+    // 微分を使う材質評価が終わってから1画素だけ書く。View間はRDGが順序付ける。
+    if (all(Lane == 0))
+    {
+        const float Covered = isfinite(Mask) && isfinite(Clipped) && Clipped >= 0 ? 1 : 0;
+        CoverageOutput[OutputPixel] = max(CoverageOutput[OutputPixel], Covered);
+    }
+#elif COVERAGE_PROBE_MODE == 3
+    if (all(Lane == 0))
+    {
+        CoverageDetails[OutputPixel] = float4(isfinite(Mask) && isfinite(Clipped) && Clipped >= 0 ? 1 : 0, Mask, Clipped, 1);
+    }
+#else
+    // Editor診断だけが判定前の値を出力する。製品の通常PSはRだけを返す。
+    OutCoverage = float4(isfinite(Mask) && isfinite(Clipped) && Clipped >= 0 ? 1 : 0, Mask, Clipped, 1);
+#if COVERAGE_PROBE_MODE == 2
+    const uint SampleIndex = uint(SvPosition.y) * CoverageWidth + uint(SvPosition.x);
+    RasterSamples[SampleIndex * 4] = PositionAndSlot;
+    // 独立したラスタ参照が選んだ三角形を、Editor診断の未使用成分へ記録する。
+    RasterSamples[SampleIndex * 4 + 1] = float4(N, PrimitiveId);
+    RasterSamples[SampleIndex * 4 + 2] = UV;
+    RasterSamples[SampleIndex * 4 + 3] = float4(Ddy, 0, 0);
+#endif
+#endif
+}
+#endif

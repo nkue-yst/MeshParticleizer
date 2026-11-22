@@ -1,0 +1,140 @@
+#include "/Engine/Private/Common.ush"
+
+// 候補数で上限を決めた表を使い、重なった面を三角形番号で分離する。
+uint Count;
+uint BucketMask;
+Buffer<float4> InputSamples;
+Texture2D<float4> CandidateNormals;
+RWBuffer<uint> BuildHeads;
+RWBuffer<uint4> BuildLinks;
+Buffer<uint> Heads;
+Buffer<uint4> Links;
+RWBuffer<float> Samples;
+#if COVERAGE_RECORD_MATCHES
+RWBuffer<uint> Matches;
+#endif
+Buffer<float4> Vertices;
+Texture2D<float4> TriangleData;
+Texture2D<float4> SkinVertices;
+Texture2D<float4> SkinTriangles;
+Buffer<float4> Bones;
+Buffer<uint> DynamicSlots;
+uint BoneCount;
+uint MaterialSlots;
+float4x4 LocalToRelativeWorld;
+float3 WorldOrigin;
+#include "/Plugin/MeshParticleizer/Private/SurfaceCoverageGeometryCommon.ush"
+
+uint Bucket(uint3 Key)
+{
+    uint Hash = Key.x * 73856093u ^ Key.y * 19349663u ^ Key.z * 83492791u;
+    Hash ^= Hash >> 16;
+    return Hash & BucketMask;
+}
+
+[numthreads(64, 1, 1)]
+void BuildCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+    const uint Index = DispatchId.x;
+    if (Index >= Count)
+    {
+        return;
+    }
+    const float4 P = InputSamples[Index * 4];
+    if (P.w < 0)
+    {
+        return;
+    }
+
+    ResolvedView = ResolveView();
+    const float4 Clip = mul(float4(P.xyz, 1), ResolvedView.TranslatedWorldToClip);
+    const float2 Pixel = floor((Clip.xy / Clip.w * float2(0.5, -0.5) + 0.5) *
+        ResolvedView.ViewSizeAndInvSize.xy + ResolvedView.ViewRectMin.xy);
+    // 描画画素を持たない候補は表に入れず、入力済みの解析値をそのまま残す。
+    if (Clip.w <= 0 || Clip.z > Clip.w || all(isfinite(Pixel)) == false ||
+        any(Pixel < ResolvedView.ViewRectMin.xy) ||
+        any(Pixel >= ResolvedView.ViewRectMin.xy + ResolvedView.ViewSizeAndInvSize.xy)) { return; }
+    uint Width;
+    uint Height;
+    CandidateNormals.GetDimensions(Width, Height);
+    const uint Triangle = uint(CandidateNormals.Load(int3(Index % Width, Index / Width, 0)).w);
+    const uint3 Key = uint3(uint2(Pixel), Triangle);
+    uint Previous;
+    InterlockedExchange(BuildHeads[Bucket(Key)], Index, Previous);
+    BuildLinks[Index] = uint4(Key, Previous);
+}
+
+struct FRasterInput
+{
+    INVARIANT_OUTPUT float4 Position : SV_Position;
+    float2 UV : TEXCOORD0;
+    nointerpolation uint Triangle : TEXCOORD1;
+};
+
+void MainVS(uint VertexId : SV_VertexID, out FRasterInput Output)
+{
+    ResolvedView = ResolveView();
+#if COVERAGE_PREPARED
+    const uint Triangle = VertexId / 3, Corner = VertexId % 3;
+    const uint Stride = COVERAGE_SKINNED ? 2 : 8;
+    const float4 UV01 = LoadRow(TriangleData, Triangle * Stride);
+    const float4 UV2Slot = LoadRow(TriangleData, Triangle * Stride + 1);
+    Output.Position = float4(0, 0, 0, 1);
+    Output.UV = 0;
+    Output.Triangle = Triangle;
+    // 準備時の無効面と動的Maskを持たない面はラスタライズしない。
+    if (UV2Slot.w != 1 || UV2Slot.z < 0 || uint(UV2Slot.z) >= MaterialSlots || DynamicSlots[uint(UV2Slot.z)] == 0)
+    {
+        return;
+    }
+    float3 LocalPosition;
+#if COVERAGE_SKINNED
+    float3 LocalNormal;
+    const float3 Indices = LoadRow(SkinTriangles, Triangle).xyz;
+    if (SkinVertex(uint(Indices[Corner]), LocalPosition, LocalNormal) == false)
+    {
+        return;
+    }
+#else
+    LocalPosition = LoadRow(TriangleData, Triangle * Stride + 2 + Corner).xyz;
+#endif
+    FDFMatrix Transform;
+    Transform.M = LocalToRelativeWorld;
+    Transform.PostTranslation = WorldOrigin;
+    const float4 WorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition, Transform, ResolvedView.PreViewTranslation);
+    Output.UV = Corner == 0 ? UV01.xy : Corner == 1 ? UV01.zw : UV2Slot.xy;
+#else
+    const float3 LocalPosition = Vertices[VertexId * 4].xyz;
+    const float4 WorldPosition = DFTransformLocalToTranslatedWorld(LocalPosition,
+        DFPromote(float4x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)), ResolvedView.PreViewTranslation);
+    Output.UV = Vertices[VertexId * 4 + 2].xy;
+    Output.Triangle = VertexId / 3;
+#endif
+    Output.Position = INVARIANT(mul(WorldPosition, ResolvedView.TranslatedWorldToClip));
+}
+
+void MainPS(FRasterInput Raster)
+{
+    // 候補の有無で分岐する前に微分を求め、補助画素を同じ三角形のまま評価する。
+    const float2 Ddx = ddx(Raster.UV), Ddy = ddy(Raster.UV);
+    const uint3 Key = uint3(uint2(Raster.Position.xy), Raster.Triangle);
+    uint Index = Heads[Bucket(Key)];
+    [loop] for (uint Visited = 0; Index < Count && Visited < Count; ++Visited)
+    {
+        const uint4 Link = Links[Index];
+        if (all(Link.xyz == Key))
+        {
+            // SM5でも部分成分の書込を避け、未更新の成分を読み直さず保持する。
+            Samples[Index * 16 + 8] = Raster.UV.x;
+            Samples[Index * 16 + 9] = Raster.UV.y;
+            Samples[Index * 16 + 10] = Ddx.x;
+            Samples[Index * 16 + 11] = Ddx.y;
+            Samples[Index * 16 + 12] = Ddy.x;
+            Samples[Index * 16 + 13] = Ddy.y;
+#if COVERAGE_RECORD_MATCHES
+            InterlockedAdd(Matches[Index], 1);
+#endif
+        }
+        Index = Link.w;
+    }
+}

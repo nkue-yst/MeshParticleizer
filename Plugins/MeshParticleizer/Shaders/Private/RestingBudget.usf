@@ -1,0 +1,147 @@
+#include "/Engine/Public/Platform.ush"
+
+uint Phase;
+uint Count;
+uint SlotOffset;
+uint SourceIndex;
+uint RestingLimit;
+uint Digit;
+RWBuffer<uint> Records;
+RWBuffer<uint> Scratch;
+groupshared uint Histogram[256];
+
+// Scratch: 状態別数0..4、優先度別静止数5..7、選別条件8..11、削減数12、ヒストグラム16..271、ソース別消滅数272..335。
+[numthreads(256, 1, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID, uint3 ThreadId : SV_GroupThreadID)
+{
+    uint Id = DispatchId.x;
+    uint Lane = ThreadId.x;
+    if (Phase == 0)
+    {
+        Scratch[16 + Lane] = 0;
+        if (Lane < 16)
+        {
+            Scratch[Lane] = 0;
+        }
+        if (Lane < 64)
+        {
+            Scratch[272 + Lane] = 0;
+        }
+        return;
+    }
+    if (Phase == 2)
+    {
+        if (Lane == 0)
+        {
+            uint Excess = Scratch[3] > RestingLimit ? Scratch[3] - RestingLimit : 0;
+            Scratch[12] = Excess;
+            uint Priority = 0;
+            uint Rank = Excess;
+            while (Priority < 2 && Rank > Scratch[5 + Priority])
+            {
+                Rank -= Scratch[5 + Priority];
+                ++Priority;
+            }
+            Scratch[8] = Priority;
+            Scratch[11] = Rank;
+        }
+        return;
+    }
+    if (Phase == 4)
+    {
+        if (Lane == 0 && Scratch[12] > 0)
+        {
+            uint Rank = Scratch[11];
+            uint Value = 0;
+            while (Value < 255 && Rank > Scratch[16 + Value])
+            {
+                Rank -= Scratch[16 + Value];
+                ++Value;
+            }
+            uint Shift = Digit < 4 ? 24 - Digit * 8 : 16 - (Digit - 4) * 8;
+            Scratch[Digit < 4 ? 9 : 10] |= Value << Shift;
+            Scratch[11] = Rank;
+            if (Digit == 6)
+            {
+                Scratch[3] -= Scratch[12];
+                Scratch[4] += Scratch[12];
+            }
+        }
+        DeviceMemoryBarrierWithGroupSync();
+        Scratch[16 + Lane] = 0;
+        return;
+    }
+    if (Phase == 1)
+    {
+        if (Lane < 8)
+        {
+            Histogram[Lane] = 0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (Id < Count)
+        {
+            uint State = Records[Id * 4];
+            InterlockedAdd(Histogram[min(State, 4)], 1);
+            if (State == 3)
+            {
+                InterlockedAdd(Histogram[5 + min(Records[Id * 4 + 3], 2)], 1);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (Lane < 8 && Histogram[Lane] > 0)
+        {
+            InterlockedAdd(Scratch[Lane], Histogram[Lane]);
+        }
+        if (Lane == 0 && Histogram[0] > 0)
+        {
+            InterlockedAdd(Scratch[272 + SourceIndex], Histogram[0]);
+        }
+        return;
+    }
+    if (Phase == 3)
+    {
+        // UAVの値で早期returnせず、グループ内の全スレッドを同じ同期点へ通す。
+        Histogram[Lane] = 0;
+        GroupMemoryBarrierWithGroupSync();
+        if (Id < Count && Scratch[12] > 0)
+        {
+            uint State = Records[Id * 4];
+            uint Time = Records[Id * 4 + 1];
+            uint Priority = Records[Id * 4 + 3];
+            uint Slot = SlotOffset + Id;
+            uint Shift = Digit < 4 ? 24 - Digit * 8 : 16 - (Digit - 4) * 8;
+            uint PrefixMask = Shift == 24 ? 0 : 0xffffffffu << (Shift + 8);
+            bool Match = State == 3 && Priority == Scratch[8];
+            Match = Match && (Digit < 4 ? (Time & PrefixMask) == Scratch[9]
+                : Time == Scratch[9] && (Slot & PrefixMask) == Scratch[10]);
+            if (Match)
+            {
+                InterlockedAdd(Histogram[((Digit < 4 ? Time : Slot) >> Shift) & 255], 1);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (Histogram[Lane] > 0)
+        {
+            InterlockedAdd(Scratch[16 + Lane], Histogram[Lane]);
+        }
+        return;
+    }
+    if (Id >= Count)
+    {
+        return;
+    }
+
+    uint State = Records[Id * 4];
+    if (Phase == 5 && State == 3 && Scratch[12] > 0)
+    {
+        uint Time = Records[Id * 4 + 1];
+        uint Priority = Records[Id * 4 + 3];
+        bool Selected = Priority < Scratch[8] || (Priority == Scratch[8]
+            && (Time < Scratch[9] || (Time == Scratch[9] && SlotOffset + Id <= Scratch[10])));
+        if (Selected)
+        {
+            // 時刻は最後のGPU更新が記録した値。次の更新から0.25秒のフェードを適用する。
+            Records[Id * 4] = 4;
+        }
+    }
+}

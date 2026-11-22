@@ -1,0 +1,89 @@
+#ifndef MESH_PARTICLEIZER_COMMON
+#define MESH_PARTICLEIZER_COMMON
+
+float3 MP_ProgressPosition(float3 P, float4 X, float4 Y, float4 Z)
+{
+    float4 Reference = float4(P, 1);
+    return float3(dot(Reference, X), dot(Reference, Y), dot(Reference, Z));
+}
+
+// マテリアルと粒子は同じ参照座標、Seed、進行式を使う。
+float MP_Order(float3 P, float3 BoundsMin, float3 BoundsMax, float3 Direction, float3 Origin, int Mode, float Seed)
+{
+    float3 Center = (BoundsMin + BoundsMax) * 0.5;
+    float3 Extent = max((BoundsMax - BoundsMin) * 0.5, 0.0001);
+    if (Mode == 0)
+    {
+        float Span = max(dot(abs(Direction), Extent) * 2.0, 0.0001);
+        return saturate(dot(P - Center, Direction) / Span + 0.5);
+    }
+    if (Mode == 4)
+    {
+        return frac(sin(dot(floor((P - BoundsMin) * 0.15), float3(12.9898, 78.233, 37.719)) + Seed) * 43758.5453);
+    }
+    float3 Start = Mode == 3 ? Origin : Center;
+    float MaxDistance = length(max(abs(BoundsMin - Start), abs(BoundsMax - Start)));
+    float Q = saturate(length(P - Start) / max(MaxDistance, 0.0001));
+    return Mode == 2 ? 1.0 - Q : Q;
+}
+
+float MP_Order(float3 P, float3 BoundsMin, float3 BoundsMax, float3 Direction, float3 Origin, int Mode, float Seed,
+    float3 Origin1, float3 Origin2, float3 Origin3, int OriginCount, float OriginDistance)
+{
+    if (Mode != 7)
+    {
+        return MP_Order(P, BoundsMin, BoundsMax, Direction, Origin, Mode, Seed);
+    }
+    // 点ごとに距離を正規化せず、最も近い起点までの距離を共通の範囲で評価する。
+    float Distance = length(P - Origin);
+    if (OriginCount > 1)
+    {
+        Distance = min(Distance, length(P - Origin1));
+    }
+    if (OriginCount > 2)
+    {
+        Distance = min(Distance, length(P - Origin2));
+    }
+    if (OriginCount > 3)
+    {
+        Distance = min(Distance, length(P - Origin3));
+    }
+    return saturate(Distance / max(OriginDistance, 0.0001));
+}
+
+float MP_Bezier(float4 P, float Alpha)
+{
+    float3 First = lerp(P.xyz, P.yzw, Alpha);
+    float2 Second = lerp(First.xy, First.yz, Alpha);
+    return lerp(Second.x, Second.y, Alpha);
+}
+
+float MP_InverseBezier(float4 P, float Value)
+{
+    if (Value <= P.x)
+    {
+        return 0;
+    }
+    if (Value >= P.w)
+    {
+        return 1;
+    }
+    float Lower = 0;
+    float Upper = 1;
+    [unroll] for (int Iteration = 0; Iteration < 24; ++Iteration)
+    {
+        float Middle = (Lower + Upper) * 0.5;
+        if (MP_Bezier(P, Middle) < Value)
+        {
+            Lower = Middle;
+        }
+        else
+        {
+            Upper = Middle;
+        }
+    }
+    return Upper;
+}
+
+#endif
+

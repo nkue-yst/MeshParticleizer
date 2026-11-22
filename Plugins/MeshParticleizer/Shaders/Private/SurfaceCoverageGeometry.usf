@@ -1,0 +1,218 @@
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float4> Positions;
+Texture2D<float4> Normals;
+Texture2D<float4> Coordinates;
+Texture2D<float4> TriangleData;
+Texture2D<float4> SkinVertices;
+Texture2D<float4> SkinTriangles;
+Buffer<float4> Bones;
+RWBuffer<float4> Samples;
+uint Count;
+uint BoneCount;
+Buffer<uint> DynamicSlots;
+uint MaterialSlots;
+float4x4 LocalToTranslatedWorld;
+float4x4 LocalToWorldNoScale;
+
+#include "/Plugin/MeshParticleizer/Private/SurfaceCoverageGeometryCommon.ush"
+
+// 画面上の同じ三角形を、透視補正した重心座標で評価する。
+float3 RasterWeights(float2 Pixel, float2 S0, float2 S1, float2 S2, float3 InvW)
+{
+    const float2 A = S0 - Pixel, B = S1 - Pixel, C = S2 - Pixel;
+    // 共通面積で一度割ってから引き算しない。細い投影面での桁落ちと余分な除算を避ける。
+    const float3 Weights = float3(B.x * C.y - B.y * C.x, C.x * A.y - C.y * A.x, A.x * B.y - A.y * B.x) * InvW;
+    return Weights / (Weights.x + Weights.y + Weights.z);
+}
+
+struct FCoverageVertex
+{
+    float4 Clip;
+    float3 Position;
+    float3 Normal;
+    float2 UV;
+};
+
+FCoverageVertex MakeCoverageVertex(float3 Position, float3 Normal, float2 UV)
+{
+    FCoverageVertex V;
+    V.Position = mul(float4(Position, 1), LocalToTranslatedWorld).xyz;
+    // 標準Depth/Base Passと同じ演算精度を保ち、副画素への丸め位置を揃える。
+    V.Clip = INVARIANT(mul(float4(V.Position, 1), ResolvedView.TranslatedWorldToClip));
+    V.Normal = Normal;
+    V.UV = UV;
+    return V;
+}
+
+FCoverageVertex InterpolateCoverageVertex(FCoverageVertex A, FCoverageVertex B, float T)
+{
+    FCoverageVertex V;
+    V.Clip = lerp(A.Clip, B.Clip, T);
+    V.Position = lerp(A.Position, B.Position, T);
+    V.Normal = lerp(A.Normal, B.Normal, T);
+    V.UV = lerp(A.UV, B.UV, T);
+    return V;
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+    const uint Index = DispatchId.x;
+    if (Index >= Count)
+    {
+        return;
+    }
+    // 無効・退化した候補を、別のViewや前フレームの値で評価しない。
+    Samples[Index * 4] = float4(0, 0, 0, -1);
+    Samples[Index * 4 + 1] = 0;
+    Samples[Index * 4 + 2] = 0;
+    Samples[Index * 4 + 3] = 0;
+    const float4 P = LoadRow(Positions, Index);
+#if COVERAGE_FILTER_SLOTS
+    // 動的Maskがないスロットの頂点・骨は読み出さない。
+    if (P.w < 0 || uint(P.w) >= MaterialSlots || DynamicSlots[uint(P.w)] == 0)
+    {
+        return;
+    }
+#endif
+    const float4 N = LoadRow(Normals, Index);
+    const float4 UV = LoadRow(Coordinates, Index);
+    const uint Triangle = uint(N.w);
+    const uint Stride = COVERAGE_SKINNED ? 2 : 8;
+    if (!ContainsRow(TriangleData, Triangle * Stride + Stride - 1))
+    {
+        return;
+    }
+    const float4 UV01 = LoadRow(TriangleData, Triangle * Stride);
+    const float2 UV2 = LoadRow(TriangleData, Triangle * Stride + 1).xy;
+    const float4 UVEdges = float4(UV01.zw - UV01.xy, UV2 - UV01.xy);
+    float3 LocalP = P.xyz;
+    float3 LocalN = N.xyz;
+    float3 P0;
+    float3 P1;
+    float3 P2;
+    float3 N0;
+    float3 N1;
+    float3 N2;
+#if COVERAGE_SKINNED
+    {
+        if (!ContainsRow(SkinTriangles, Triangle))
+        {
+            return;
+        }
+        const float4 Vertices = LoadRow(SkinTriangles, Triangle);
+        if (!SkinVertex(uint(Vertices.x), P0, N0) || !SkinVertex(uint(Vertices.y), P1, N1) ||
+            !SkinVertex(uint(Vertices.z), P2, N2)) { return; }
+        const float3 Bary = float3(UV.zw, 1 - UV.z - UV.w);
+        LocalP = P0 * Bary.x + P1 * Bary.y + P2 * Bary.z;
+        LocalN = N0 * Bary.x + N1 * Bary.y + N2 * Bary.z;
+    }
+#else
+    {
+        P0 = LoadRow(TriangleData, Triangle * Stride + 2).xyz;
+        P1 = LoadRow(TriangleData, Triangle * Stride + 3).xyz;
+        P2 = LoadRow(TriangleData, Triangle * Stride + 4).xyz;
+        N0 = LoadRow(TriangleData, Triangle * Stride + 5).xyz;
+        N1 = LoadRow(TriangleData, Triangle * Stride + 6).xyz;
+        N2 = LoadRow(TriangleData, Triangle * Stride + 7).xyz;
+    }
+#endif
+
+    ResolvedView = ResolveView();
+    float3 WorldP = mul(float4(LocalP, 1), LocalToTranslatedWorld).xyz;
+    float3 WorldN = mul(float4(LocalN, 0), LocalToWorldNoScale).xyz;
+    const float4 ClipP = INVARIANT(mul(float4(WorldP, 1), ResolvedView.TranslatedWorldToClip));
+    if (dot(WorldN, WorldN) <= 1e-20)
+    {
+        return;
+    }
+    const float4 ClipEdge1 = mul(mul(float4(P1 - P0, 0), LocalToTranslatedWorld), ResolvedView.TranslatedWorldToClip);
+    const float4 ClipEdge2 = mul(mul(float4(P2 - P0, 0), LocalToTranslatedWorld), ResolvedView.TranslatedWorldToClip);
+    const float2 PixelScale = ResolvedView.ViewSizeAndInvSize.xy * float2(0.5, -0.5);
+    // 透視除算のwを逆ヤコビアンまで整理する。背面やw=0でも候補を穴にしない。
+    const float2 J1 = ClipEdge1.xy * ClipP.w - ClipP.xy * ClipEdge1.w;
+    const float2 J2 = ClipEdge2.xy * ClipP.w - ClipP.xy * ClipEdge2.w;
+    const float Det = dot(ClipP.xyw, cross(ClipEdge1.xyw, ClipEdge2.xyw));
+    // UVの退化は許容する。面の投影が真に退化した場合だけ微分を定義できない。
+    if (Det == 0 || !isfinite(Det))
+    {
+        return;
+    }
+    float2 Ddx = (UVEdges.xy * J2.y - UVEdges.zw * J1.y) * (ClipP.w / Det / PixelScale.x);
+    float2 Ddy = (-UVEdges.xy * J2.x + UVEdges.zw * J1.x) * (ClipP.w / Det / PixelScale.y);
+    float2 SampleUV = UV.xy;
+
+    // 描画できる面ではD3D12の8bit副画素と画素中心に合わせる。骨変形後も同じ経路を使う。
+    // 近面をまたぐ面は頂点属性ごと切り出す。背面・投影不能な候補は連続面の微分を保つ。
+    if (ClipP.w > 0 && ClipP.z <= ClipP.w)
+    {
+        FCoverageVertex Original[3];
+        Original[0] = MakeCoverageVertex(P0, N0, UV01.xy);
+        Original[1] = MakeCoverageVertex(P1, N1, UV01.zw);
+        Original[2] = MakeCoverageVertex(P2, N2, UV2);
+        FCoverageVertex Clipped[4];
+        uint VertexCount = 0;
+        [unroll] for (uint Corner = 0; Corner < 3; ++Corner)
+        {
+            const FCoverageVertex A = Original[(Corner + 2) % 3];
+            const FCoverageVertex B = Original[Corner];
+            const float DA = A.Clip.w - A.Clip.z, DB = B.Clip.w - B.Clip.z;
+            if ((DA >= 0) != (DB >= 0))
+            {
+                Clipped[VertexCount++] = InterpolateCoverageVertex(A, B, DA / (DA - DB));
+            }
+            if (DB >= 0)
+            {
+                Clipped[VertexCount++] = B;
+            }
+        }
+        const float2 Bias = ResolvedView.ViewSizeAndInvSize.xy * 0.5 + ResolvedView.ViewRectMin.xy;
+        const float2 Pixel = floor(ClipP.xy / ClipP.w * PixelScale + Bias) + 0.5;
+        const float2 Quad = floor(Pixel * 0.5) * 2 + 0.5;
+        [loop] for (uint Fan = 1; Fan + 1 < VertexCount; ++Fan)
+        {
+            const FCoverageVertex V0 = Clipped[0], V1 = Clipped[Fan], V2 = Clipped[Fan + 1];
+            const float4 C0 = V0.Clip, C1 = V1.Clip, C2 = V2.Clip;
+            if (min(C0.w, min(C1.w, C2.w)) <= 0)
+            {
+                continue;
+            }
+            const float2 S0 = round((C0.xy / C0.w * PixelScale + Bias) * 256) / 256;
+            const float2 S1 = round((C1.xy / C1.w * PixelScale + Bias) * 256) / 256;
+            const float2 S2 = round((C2.xy / C2.w * PixelScale + Bias) * 256) / 256;
+            const float2 A = S1 - S0, B = S2 - S0;
+            const float Area = A.x * B.y - A.y * B.x;
+            if (Area != 0 && isfinite(Area))
+            {
+                const float3 InvW = rcp(float3(C0.w, C1.w, C2.w));
+                const float3 Bary = RasterWeights(Pixel, S0, S1, S2, InvW);
+                const float3 Q0 = RasterWeights(Quad, S0, S1, S2, InvW);
+                const float3 QX = RasterWeights(Quad + float2(1, 0), S0, S1, S2, InvW);
+                const float3 QY = RasterWeights(Quad + float2(0, 1), S0, S1, S2, InvW);
+                if (all(isfinite(Bary)) && all(isfinite(QX)) && all(isfinite(QY)))
+                {
+                    SampleUV = INVARIANT(V0.UV * Bary.x + V1.UV * Bary.y + V2.UV * Bary.z);
+                    const float2 QuadUV = V0.UV * Q0.x + V1.UV * Q0.y + V2.UV * Q0.z;
+                    // 補間後のfloat同士の差分にする。最適化による式の融合を微分へ持ち込まない。
+                    Ddx = INVARIANT((V0.UV * QX.x + V1.UV * QX.y + V2.UV * QX.z) - QuadUV);
+                    Ddy = INVARIANT((V0.UV * QY.x + V1.UV * QY.y + V2.UV * QY.z) - QuadUV);
+                    WorldP = V0.Position * Bary.x + V1.Position * Bary.y + V2.Position * Bary.z;
+                    WorldN = mul(float4(V0.Normal * Bary.x + V1.Normal * Bary.y + V2.Normal * Bary.z, 0), LocalToWorldNoScale).xyz;
+                    // 新しい三角形間の対角線でも、画素中心が属する面を優先する。
+                    if (all(Bary >= 0))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if (!all(isfinite(WorldP)) || !all(isfinite(WorldN)) || dot(WorldN, WorldN) <= 1e-20 || !all(isfinite(SampleUV)) ||
+        !all(isfinite(Ddx)) || !all(isfinite(Ddy))) { return; }
+
+    Samples[Index * 4] = float4(WorldP, P.w);
+    Samples[Index * 4 + 1] = float4(normalize(WorldN), 0);
+    Samples[Index * 4 + 2] = float4(SampleUV, Ddx);
+    Samples[Index * 4 + 3] = float4(Ddy, 0, 0);
+}

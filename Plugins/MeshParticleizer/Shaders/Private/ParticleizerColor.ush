@@ -1,0 +1,15 @@
+uint {ParameterName}_Count;
+Buffer<float4> {ParameterName}_Colors;
+
+void GetColor_{ParameterName}(int Index, float4 Baked, out float4 Color)
+{
+    Color = Baked;
+    if (Index >= 0 && (uint)Index < {ParameterName}_Count)
+    {
+        float4 DynamicColor = {ParameterName}_Colors[Index];
+        if (DynamicColor.a > 0)
+        {
+            Color.rgb = DynamicColor.rgb;
+        }
+    }
+}

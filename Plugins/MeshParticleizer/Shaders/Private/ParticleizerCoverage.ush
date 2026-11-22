@@ -1,0 +1,9 @@
+uint {ParameterName}_Enabled;
+uint {ParameterName}_Count;
+Texture2D<float> {ParameterName}_Coverage;
+
+void GetCoverage_{ParameterName}(int Index, out bool Covered)
+{
+    Covered = {ParameterName}_Enabled == 0 || (Index >= 0 && uint(Index) < {ParameterName}_Count &&
+        {ParameterName}_Coverage.Load(int3(Index % 512, Index / 512, 0)) > 0.5);
+}

@@ -1,0 +1,66 @@
+#ifndef MESH_PARTICLEIZER_PREVIEW_VELOCITY
+#define MESH_PARTICLEIZER_PREVIEW_VELOCITY
+
+// サンプル番号から固定の部分集合を選ぶ。移動・カメラ・表示切替で対象を変えない。
+bool MP_PreviewVelocitySample(float Index, float Stride)
+{
+    uint H = (uint)round(Index);
+    H ^= H >> 16; H *= 0x7feb352du;
+    H ^= H >> 15; H *= 0x846ca68bu;
+    H ^= H >> 16;
+    return H % max((uint)Stride, 1u) == 0;
+}
+
+float3 MP_PreviewVelocityColor(float Speed, float Maximum)
+{
+    if (Speed < 0.1)
+    {
+        return float3(0.35, 0.35, 0.35);
+    }
+    float T = saturate(Speed / max(Maximum, 1));
+    return T < 0.5 ? lerp(float3(0.015, 0.12, 0.8), float3(0.02, 0.8, 0.5), T * 2)
+        : lerp(float3(0.02, 0.8, 0.5), float3(1, 0.12, 0.015), (T - 0.5) * 2);
+}
+
+float MP_PreviewVelocityMask(float2 UV, float3 ViewDirection, float Speed, float Index, float Stride, float Alpha)
+{
+    if (MP_PreviewVelocitySample(Index, Stride) == false || Alpha <= 0)
+    {
+        return 0;
+    }
+    float2 P = UV - 0.5;
+    float Radius = length(P);
+    if (Speed < 0.1)
+    {
+        return Alpha * (Radius < 0.3);
+    }
+    if (length(ViewDirection.xy) < 0.05)
+    {
+        // 視線方向への運動は、手前を丸点、奥を交差線で示す。
+        bool Ring = Radius > 0.34 && Radius < 0.44;
+        bool Center = ViewDirection.z < 0 ? Radius < 0.12
+            : (Radius < 0.24 && min(abs(P.x - P.y), abs(P.x + P.y)) < 0.055);
+        return Alpha * (Ring || Center);
+    }
+    float Along = 1 - UV.y;
+    bool Head = Along >= 0.55 && abs(P.x * 2) < (1 - Along) / 0.45;
+    bool Shaft = Along >= 0.05 && Along < 0.65 && abs(P.x) < 0.10;
+    return Alpha * (Head || Shaft);
+}
+
+float3 MP_PreviewVelocityOffset(float2 UV, float3 ViewDirection, float Speed, float Maximum, float Index, float Stride, float Alpha)
+{
+    // 非表示分のQuadは点へ畳み、診断用の拡大による不要な画素処理を避ける。
+    if (MP_PreviewVelocitySample(Index, Stride) == false || Alpha <= 0)
+    {
+        return 0;
+    }
+    float Projected = length(ViewDirection.xy);
+    bool Symbol = Speed < 0.1 || Projected < 0.05;
+    float2 Along = Symbol ? float2(0, 1) : ViewDirection.xy / Projected;
+    float2 Across = float2(Along.y, -Along.x);
+    float Width = Symbol ? 3.6 : 1.8;
+    float Length = Symbol ? Width : max(4.5, 15 * saturate(Speed / max(Maximum, 1)) * Projected);
+    return float3(Across * (UV.x - 0.5) * Width + Along * (0.5 - UV.y) * Length, 0);
+}
+#endif

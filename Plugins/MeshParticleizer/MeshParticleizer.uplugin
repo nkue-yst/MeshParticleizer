@@ -1,0 +1,47 @@
+{
+  "FileVersion": 3,
+  "Version": 7,
+  "VersionName": "0.1.6",
+  "FriendlyName": "Mesh Particleizer",
+  "Description": "Prepared mesh surface particleization with bounded GPU effects.",
+  "Category": "Visual Effects",
+  "EngineVersion": "5.8.0",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "SupportedTargetPlatforms": [
+    "Win64"
+  ],
+  "Modules": [
+    {
+      "Name": "MeshParticleizerRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "MeshParticleizerRendering",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit"
+    },
+    {
+      "Name": "MeshParticleizerEditor",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "MeshParticleizerTests",
+      "Type": "DeveloperTool",
+      "LoadingPhase": "Default",
+      "TargetAllowList": [
+        "Editor"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "Niagara",
+      "Enabled": true
+    }
+  ],
+  "EnabledByDefault": false
+}

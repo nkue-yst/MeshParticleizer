@@ -1,0 +1,48 @@
+// 入力IDは固定候補の番号。分離前には描画せず、軽量な順序値だけを保持する。
+int Index = ExecIndex();
+float4 SamplePosition = float4(0, 0, 0, 0);
+PositionData.LoadTexture2D(Index % 512, Index / 512, 0, SamplePosition);
+float3 ProgressPosition = MP_ProgressPosition(SamplePosition.xyz, ProgressX, ProgressY, ProgressZ);
+OutOrder = MP_Order(ProgressPosition, BoundsMin, BoundsMax, Direction, Origin, Mode, Seed,
+    Origin1, Origin2, Origin3, OriginCount, OriginDistance);
+OutDetachFraction = OutOrder;
+if (CurveSegmentCount > 0 && OutOrder > 0)
+{
+    // 最初に順序値へ到達する区間を一度だけ探す。平坦部と段差でも分離を重複させない。
+    int Lower = 0;
+    int Upper = CurveSegmentCount - 1;
+    float4 Values;
+    while (Lower < Upper)
+    {
+        int Middle = (Lower + Upper) / 2;
+        ProgressCurve.Get(Middle * 2 + 1, Values);
+        if (Values.w < OutOrder)
+        {
+            Lower = Middle + 1;
+        }
+        else
+        {
+            Upper = Middle;
+        }
+    }
+    float4 Times;
+    ProgressCurve.Get(Lower * 2, Times);
+    ProgressCurve.Get(Lower * 2 + 1, Values);
+    OutDetachFraction = MP_Bezier(Times, MP_InverseBezier(Values, OutOrder));
+}
+OutIndex = Index;
+OutPosition = float3(0, 0, 0);
+OutVelocity = float3(0, 0, 0);
+OutColor = float4(0, 0, 0, 0);
+OutSourceColor = float4(0, 0, 0, 0);
+// 発光RGBと同じ既存属性の未使用成分へ、描画診断用のサンプル番号を保持する。
+OutSourceEmission = float4(0, 0, 0, Index);
+OutDetached = 0;
+OutRestTime = 0;
+OutSleeping = 0;
+OutSize = float2(0, 0);
+OutAlive = true;
+#if MP_MESH_PARTICLES
+OutMeshScale = float3(0, 0, 0);
+OutMeshOrientation = float4(0, 0, 0, 1);
+#endif

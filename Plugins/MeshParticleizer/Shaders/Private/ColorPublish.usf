@@ -1,0 +1,18 @@
+#include "/Engine/Public/Platform.ush"
+
+int2 Size;
+uint PreserveHDR;
+Texture2D<float4> Input;
+RWTexture2D<float4> Output;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 Thread : SV_DispatchThreadID)
+{
+    if (any(Thread.xy >= (uint2)Size))
+    {
+        return;
+    }
+    float3 Color = Input.Load(int3(Thread.xy, 0)).rgb;
+    // halfの公開画像で表せる有限値へ揃える。表面色は従来どおり0..1、発光はHDRを保持する。
+    Output[Thread.xy] = float4(all(isfinite(Color)) ? clamp(Color, 0, PreserveHDR != 0 ? 65504 : 1) : 0, 1);
+}

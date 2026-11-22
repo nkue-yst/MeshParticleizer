@@ -1,0 +1,58 @@
+float4 LoadRow(Texture2D<float4> Data, uint Index)
+{
+    uint Width;
+    uint Height;
+    Data.GetDimensions(Width, Height);
+    return Data.Load(int3(Index % Width, Index / Width, 0));
+}
+
+bool ContainsRow(Texture2D<float4> Data, uint Index)
+{
+    uint Width;
+    uint Height;
+    Data.GetDimensions(Width, Height);
+    return Index < Width * Height;
+}
+
+#if COVERAGE_SKINNED
+bool SkinVertex(uint Vertex, out float3 Position, out float3 Normal)
+{
+    Position = 0;
+    Normal = 0;
+    if (!ContainsRow(SkinVertices, Vertex * 8 + 7))
+    {
+        return false;
+    }
+    const float4 RefP = LoadRow(SkinVertices, Vertex * 8);
+    const float4 RefN = LoadRow(SkinVertices, Vertex * 8 + 1);
+    [unroll] for (uint Group = 0; Group < 3; ++Group)
+    {
+        const float4 Indices = LoadRow(SkinVertices, Vertex * 8 + 2 + Group * 2);
+        const float4 Weights = LoadRow(SkinVertices, Vertex * 8 + 3 + Group * 2);
+        [unroll] for (uint Influence = 0; Influence < 4; ++Influence)
+        {
+            if (Weights[Influence] > 0)
+            {
+                const uint Bone = uint(Indices[Influence]);
+                if (Bone >= BoneCount)
+                {
+                    return false;
+                }
+                const float4 X = Bones[Bone * 3];
+                const float4 Y = Bones[Bone * 3 + 1];
+                const float4 Z = Bones[Bone * 3 + 2];
+                Position += float3(dot(RefP, X), dot(RefP, Y), dot(RefP, Z)) * Weights[Influence];
+                Normal += float3(dot(RefN, X), dot(RefN, Y), dot(RefN, Z)) * Weights[Influence];
+            }
+        }
+    }
+    // UEのGpuSkin VFと同じく、頂点ごとに正規化してから面内で補間する。
+    if (dot(Normal, Normal) <= 1e-20)
+    {
+        return false;
+    }
+    Normal = normalize(Normal);
+    return all(isfinite(Position)) && all(isfinite(Normal));
+}
+#endif
+

@@ -1,0 +1,23 @@
+#include "/Engine/Private/Common.ush"
+
+Texture2D<float4> Positions;
+Buffer<uint> DynamicSlots;
+RWTexture2D<float> Coverage;
+uint Count;
+uint MaterialSlots;
+uint CoverageWidth;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchId : SV_DispatchThreadID)
+{
+    const uint Index = DispatchId.x;
+    if (Index >= Count)
+    {
+        return;
+    }
+    uint Width;
+    uint Height;
+    Positions.GetDimensions(Width, Height);
+    const uint Slot = uint(Positions.Load(int3(Index % Width, Index / Width, 0)).w);
+    Coverage[uint2(Index % CoverageWidth, Index / CoverageWidth)] = Slot < MaterialSlots && DynamicSlots[Slot] == 0 ? 1 : 0;
+}

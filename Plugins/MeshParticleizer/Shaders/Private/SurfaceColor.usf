@@ -1,0 +1,39 @@
+#include "/Engine/Public/Platform.ush"
+
+uint Count;
+uint Slot;
+uint Enabled;
+uint ClampColor;
+float2 UVScale;
+float2 UVOffset;
+float3 ColorScale;
+Texture2D<float4> Positions;
+Texture2D<float4> Coordinates;
+Texture2D<float4> SourceTexture;
+SamplerState SourceSampler;
+RWBuffer<float4> Colors;
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 Thread : SV_DispatchThreadID)
+{
+    uint Index = Thread.x;
+    if (Index >= Count)
+    {
+        return;
+    }
+    int3 Pixel = int3(Index % 512, Index / 512, 0);
+    if ((uint)Positions.Load(Pixel).w != Slot)
+    {
+        return;
+    }
+
+    // Alphaは有効な動的色の印。0なら分離時に従来のベイク色を使う。
+    float4 Color = 0;
+    if (Enabled != 0)
+    {
+        float2 UV = Coordinates.Load(Pixel).xy * UVScale + UVOffset;
+        float3 Value = SourceTexture.SampleLevel(SourceSampler, UV, 0).rgb * ColorScale;
+        Color = float4(ClampColor != 0 ? saturate(Value) : Value, 1);
+    }
+    Colors[Index] = Color;
+}

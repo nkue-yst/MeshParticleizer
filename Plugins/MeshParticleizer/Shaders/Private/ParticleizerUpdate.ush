@@ -1,0 +1,261 @@
+OutPosition = InPosition;
+OutVelocity = InVelocity;
+OutColor = InColor;
+OutSourceColor = InSourceColor;
+OutSourceEmission = InSourceEmission;
+OutDetached = InDetached;
+OutRestTime = InRestTime;
+OutSleeping = InSleeping;
+OutSize = float2(0, 0);
+OutAlive = true;
+#if MP_MESH_PARTICLES
+OutMeshOrientation = InMeshOrientation;
+#endif
+
+// 分離後の経過時間と、今回の更新で進んだ時間を別々に求める。
+float DetachTime = DetachFraction * Duration;
+float Age = Elapsed - DetachTime;
+float Step = max(0, Elapsed - PreviousElapsed);
+
+// 分離するフレームだけ位置・法線・色を読む。分離後は元メッシュを参照しない。
+if (InDetached < 0.5 && Age >= 0)
+{
+    bool Covered;
+    SurfaceCoverage.GetCoverage(Index, Covered);
+    if (SourceAvailable < 0.5 || Lifetime <= 0 || !Covered)
+    {
+        OutAlive = false;
+    }
+    else
+    {
+        float4 P;
+        float4 N;
+        float4 C;
+        PositionData.LoadTexture2D(Index % 512, Index / 512, 0, P);
+        NormalData.LoadTexture2D(Index % 512, Index / 512, 0, N);
+        ColorData.LoadTexture2D(Index % 512, Index / 512, 0, C);
+
+        // 公開済みの色と、マテリアルスロットごとの色補正を適用する。
+        float4 RegisteredColor;
+        SurfaceColor.GetColor(Index, C, RegisteredColor);
+        C = RegisteredColor;
+        float4 SurfaceTint;
+        SurfaceTints.Get((int)P.w, SurfaceTint);
+        C.rgb = saturate(C.rgb * SurfaceTint.rgb);
+
+        float3 LocalNow = P.xyz;
+        float3 LocalBefore = P.xyz;
+        float3 LocalNormal = N.xyz;
+        if (Skinned > 0.5)
+        {
+            float4 Coordinates;
+            float4 Triangle;
+            CoordinateData.LoadTexture2D(Index % 512, Index / 512, 0, Coordinates);
+            int TriangleIndex = (int)N.w;
+            SkinTriangles.LoadTexture2D(TriangleIndex % 512, TriangleIndex / 512, 0, Triangle);
+            float3 Bary = float3(Coordinates.zw, 1 - Coordinates.z - Coordinates.w);
+            LocalNow = 0;
+            LocalBefore = 0;
+            LocalNormal = 0;
+            // 準備時に固定した三角形の各頂点を、分離時だけGPUでスキニングする。
+            [unroll] for (int Corner = 0; Corner < 3; ++Corner)
+            {
+                int Vertex = (int)Triangle[Corner] * 8;
+                float4 RefP;
+                float4 RefN;
+                SkinVertices.LoadTexture2D(Vertex % 512, Vertex / 512, 0, RefP);
+                SkinVertices.LoadTexture2D((Vertex + 1) % 512, (Vertex + 1) / 512, 0, RefN);
+                [unroll] for (int Group = 0; Group < 3; ++Group)
+                {
+                    int Offset = Vertex + 2 + Group * 2;
+                    float4 BoneIndices;
+                    float4 Weights;
+                    SkinVertices.LoadTexture2D(Offset % 512, Offset / 512, 0, BoneIndices);
+                    SkinVertices.LoadTexture2D((Offset + 1) % 512, (Offset + 1) / 512, 0, Weights);
+                    [unroll] for (int Influence = 0; Influence < 4; ++Influence)
+                    {
+                        float Weight = Weights[Influence] * Bary[Corner];
+                        if (Weight > 0)
+                        {
+                            int Bone = (int)BoneIndices[Influence] * 3;
+                            float4 X;
+                            float4 Y;
+                            float4 Z;
+                            float4 PX;
+                            float4 PY;
+                            float4 PZ;
+                            Bones.Get(Bone, X);
+                            Bones.Get(Bone + 1, Y);
+                            Bones.Get(Bone + 2, Z);
+                            PreviousBones.Get(Bone, PX);
+                            PreviousBones.Get(Bone + 1, PY);
+                            PreviousBones.Get(Bone + 2, PZ);
+
+                            LocalNow += float3(dot(RefP, X), dot(RefP, Y), dot(RefP, Z)) * Weight;
+                            LocalBefore += float3(dot(RefP, PX), dot(RefP, PY), dot(RefP, PZ)) * Weight;
+                            LocalNormal += float3(dot(RefN, X), dot(RefN, Y), dot(RefN, Z)) * Weight;
+                        }
+                    }
+                }
+            }
+        }
+
+        // コンポーネントの前回・今回の変換から、メッシュ全体の移動速度を求める。
+        float3 Now = float3(dot(float4(LocalNow, 1), TransformX), dot(float4(LocalNow, 1), TransformY), dot(float4(LocalNow, 1), TransformZ));
+        float3 Before = float3(dot(float4(LocalNow, 1), PreviousX), dot(float4(LocalNow, 1), PreviousY), dot(float4(LocalNow, 1), PreviousZ));
+        float Fraction = HistoryValid > 0.5 ? saturate((DetachTime - PosePreviousElapsed) / max(PoseDeltaSeconds, 0.00001)) : 1;
+        float3 SurfaceVelocity = HistoryValid > 0.5 ? (Now - Before) / max(PoseDeltaSeconds, 0.00001)
+            : FallbackVelocity + cross(FallbackAngularVelocity, Now - FallbackCenter);
+        float3 LocalDetach = LocalNow;
+        if (Skinned > 0.5 && BoneHistoryValid > 0.5)
+        {
+            float BoneFraction = saturate((DetachTime - BonePreviousElapsed) / max(BoneDeltaSeconds, 0.00001));
+            LocalDetach = lerp(LocalBefore, LocalNow, BoneFraction);
+            float4 BoneVelocity = float4((LocalNow - LocalBefore) / max(BoneDeltaSeconds, 0.00001), 0);
+
+            // 骨の局所運動とComponentの運動を分け、Actor移動を二重加算しない。
+            SurfaceVelocity += float3(dot(BoneVelocity, PreviousX), dot(BoneVelocity, PreviousY), dot(BoneVelocity, PreviousZ));
+        }
+
+        // 分離時刻の表面位置を、前後の姿勢から補間する。
+        float3 DetachNow = float3(dot(float4(LocalDetach, 1), TransformX), dot(float4(LocalDetach, 1), TransformY), dot(float4(LocalDetach, 1), TransformZ));
+        float3 DetachBefore = float3(dot(float4(LocalDetach, 1), PreviousX), dot(float4(LocalDetach, 1), PreviousY), dot(float4(LocalDetach, 1), PreviousZ));
+        OutPosition = lerp(DetachBefore, DetachNow, Fraction);
+        SurfaceVelocity *= InheritVelocity;
+        float3 Normal = normalize(float3(dot(LocalNormal, NormalX), dot(LocalNormal, NormalY), dot(LocalNormal, NormalZ)));
+#if MP_MESH_PARTICLES
+        // Zから法線への最短回転。真下を向く面でもゼロ長Quaternionにしない。
+        OutMeshOrientation = AlignMeshToSurface > 0.5
+            ? (Normal.z < -0.99999 ? float4(1, 0, 0, 0) : normalize(float4(-Normal.y, Normal.x, 0, 1 + Normal.z)))
+            : float4(0, 0, 0, 1);
+#endif
+
+        float Scatter = Motion == 3 ? ScatterSpeed : NormalSpeed;
+        float3 Variation = frac(sin(float3(Index * 0.731 + 1, Index * 1.117 + 2, Index * 0.923 + 3)) * 43758.5453) * 2 - 1;
+        OutVelocity = SurfaceVelocity + Normal * Scatter + Variation * RandomSpeed;
+        OutVelocity *= min(1.0, MaxInitialSpeed / max(length(OutVelocity), 0.00001));
+
+        // 分離時の色と発光を粒子へ保存し、以降の入力変更から切り離す。
+        OutSourceColor = float4(C.rgb, Emissive);
+        if (InheritSourceEmission > 0.5)
+        {
+            float4 BakedEmission = 0;
+            if (HasBakedEmission > 0.5)
+            {
+                EmissionData.LoadTexture2D(Index % 512, Index / 512, 0, BakedEmission);
+            }
+            SurfaceEmission.GetColor(Index, BakedEmission, OutSourceEmission);
+        }
+
+        // ProviderのAは描画に使わず、分離後も診断対象を同じ番号で追えるようにする。
+        OutSourceEmission.w = Index;
+        OutDetached = 1;
+        Step = min(Step, max(Age, 0));
+    }
+}
+
+if (OutDetached > 0.5)
+{
+    OutAlive = Age < Lifetime;
+    // 静止後は運動・衝突を省く。寿命と消え方の時計は止めない。
+    if (OutSleeping < 0.5 && Step > 0 && OutAlive)
+    {
+        float3 Acceleration = Gravity;
+        if (Motion == 0)
+        {
+            float Phase = Index * 2.39996;
+            float3 Flutter = float3(sin(Elapsed * 1.7 + Phase), cos(Elapsed * 1.3 + Phase * 1.37), sin(Elapsed * 1.1 + Phase * 0.79));
+            Acceleration += Wind + Flutter * NoiseAcceleration;
+        }
+        float3 OldPosition = OutPosition;
+        float3 OldVelocity = OutVelocity;
+        OutVelocity = (OutVelocity + Acceleration * Step) * exp(-Drag * Step);
+        OutPosition += (OldVelocity + OutVelocity) * 0.5 * Step;
+
+        // MP_COLLISION_BEGIN
+        // 明示・検出できた平面だけに衝突させる。原点を仮の床にしない。
+        float Floor = GroundHeight + ParticleSize * CollisionRadiusScale;
+        if (GroundEnabled > 0.5 && Motion != 0 && OutPosition.z <= Floor)
+        {
+            float ContactTime = Step;
+            bool ContinuousContact = OldPosition.z <= Floor && OldVelocity.z <= 0;
+            float NormalImpulse = 0;
+            if (OutVelocity.z < 0)
+            {
+                float Rebound = 0;
+                if (!ContinuousContact)
+                {
+                    // フレーム末尾のめり込み速度ではなく、接触した時点の速度で反発する。
+                    // 微小な跳ね返りが1フレーム内に戻っても、重力でエネルギーを増やさない。
+                    float Height = max(OldPosition.z - Floor, 0);
+                    float VerticalAcceleration = (OutVelocity.z - OldVelocity.z) / Step;
+                    float Discriminant = max(OldVelocity.z * OldVelocity.z - 2 * VerticalAcceleration * Height, 0);
+                    float ImpactTime = Height > 0 ? 2 * Height / max(sqrt(Discriminant) - OldVelocity.z, 0.000001)
+                        : (OldVelocity.z > 0 && VerticalAcceleration < 0 ? -2 * OldVelocity.z / VerticalAcceleration : 0);
+                    ImpactTime = clamp(ImpactTime, 0, Step);
+                    Rebound = -min(OldVelocity.z + VerticalAcceleration * ImpactTime, 0) * Restitution;
+                    ContactTime = Step - ImpactTime;
+                    if (Motion == 2 && Rebound < SleepSpeed)
+                    {
+                        Rebound = 0;
+                    }
+                }
+                NormalImpulse = Rebound - OutVelocity.z;
+                OutVelocity.z = Rebound;
+            }
+            OutPosition.z = Floor;
+
+            // 摩擦係数は0〜1。接地を支える力でも減速し、フレーム数による固定倍率は掛けない。
+            float TangentSpeed = length(OutVelocity.xy);
+            OutVelocity.xy *= max(0, 1 - Friction * NormalImpulse / max(TangentSpeed, 0.000001));
+            bool Slow = Motion == 2 && OutVelocity.z == 0 && length(OutVelocity) < SleepSpeed;
+            if (Slow)
+            {
+                // 低速になる途中のフレームを丸ごと静止時間へ加えない。
+                bool WasSlow = ContinuousContact && length(OldVelocity) < SleepSpeed;
+                OutRestTime = WasSlow ? OutRestTime + ContactTime : (ContinuousContact ? 0 : ContactTime);
+                if (OutRestTime >= SleepDuration)
+                {
+                    OutSleeping = 1;
+                    OutVelocity = float3(0, 0, 0);
+                }
+            }
+            else
+            {
+                OutRestTime = 0;
+            }
+        }
+        else
+        {
+            OutRestTime = 0;
+        }
+        // MP_COLLISION_END
+    }
+    float Fade = FadeDuration > 0 ? saturate((Lifetime - Age) / max(min(FadeDuration, Lifetime), 0.00001)) : 1;
+    float SizeFade = Disappear == 1 || Disappear == 2 ? Fade : 1;
+    float AlphaFade = Disappear == 0 || Disappear == 2 ? Fade : 1;
+    OutSize = float2(ParticleSize, ParticleSize) * SizeFade;
+    OutColor = float4(OutSourceColor.rgb * Tint.rgb, AlphaFade * Tint.a);
+}
+
+// 全ソースの更新後に選ばれた床残留だけを短くフェードする。元の寿命は延長しない。
+float BudgetFade;
+bool BudgetAlive;
+Budget.UpdateState(Index, OutAlive, OutDetached, OutSleeping, Elapsed, BudgetFade, BudgetAlive);
+OutColor.a *= BudgetFade;
+OutAlive = BudgetAlive;
+
+#if MP_MESH_PARTICLES
+// ParticleSizeはメッシュの外接球の直径。未分離時はscale0、静止後は姿勢を保持する。
+OutMeshScale = float3(OutSize.x, OutSize.x, OutSize.x) * MeshSizeScale;
+if (OutDetached > 0.5 && OutSleeping < 0.5 && OutAlive && Step > 0)
+{
+    float3 Spin = MeshAngularVelocity * 0.01745329252;
+    float Speed = length(Spin);
+    float HalfAngle = Speed * Step * 0.5;
+    float4 Rotation = float4(Spin * (sin(HalfAngle) / max(Speed, 0.000001)), cos(HalfAngle));
+    float4 Previous = OutMeshOrientation;
+    OutMeshOrientation = normalize(float4(Rotation.w * Previous.xyz + Previous.w * Rotation.xyz + cross(Rotation.xyz, Previous.xyz),
+        Rotation.w * Previous.w - dot(Rotation.xyz, Previous.xyz)));
+}
+#endif

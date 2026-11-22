@@ -1,0 +1,80 @@
+        OutRestTime = 0;
+        if (Motion != 0)
+        {
+            float Radius = ParticleSize * CollisionRadiusScale;
+            float3 Travel = OutPosition - OldPosition;
+            float TravelLength = length(Travel);
+            float3 Direction = Travel / max(TravelLength, 0.00001);
+            float Along = 0;
+            float3 Probe = OldPosition;
+            float Distance;
+            float3 Gradient;
+            bool Valid;
+            bool Contact = false;
+            bool ReachedEnd = false;
+
+            // 終点だけで判定せず、距離場の空き距離を使って球を掃引する。
+            // 反復上限に達した場合は最後の安全位置で止め、未検証の区間を飛び越えない。
+            [loop] for (int Iteration = 0; Iteration < 12; ++Iteration)
+            {
+                Probe = OldPosition + Direction * Along;
+                Collision.QuerySurface(Probe, Distance, Gradient, Valid);
+                if (!Valid || dot(Gradient, Gradient) < 0.0000001)
+                {
+                    ReachedEnd = true;
+                    break;
+                }
+                // 押し戻し先より少し広く判定し、微小な丸め誤差で接地時間を途切れさせない。
+                if (Distance <= Radius + 0.2)
+                {
+                    Contact = true;
+                    break;
+                }
+                if (Along >= TravelLength)
+                {
+                    ReachedEnd = true;
+                    break;
+                }
+                Along = min(TravelLength, Along + max(0.05, (Distance - Radius) * 0.8));
+            }
+            if (Contact)
+            {
+                float3 Normal = normalize(Gradient);
+                float Fraction = TravelLength > 0.00001 ? saturate(Along / TravelLength) : 0;
+                float ContactTime = Step * (1 - Fraction);
+                float Incoming = dot(lerp(OldVelocity, OutVelocity, Fraction), Normal);
+                float Rebound = max(0, -Incoming * Restitution);
+                bool Supported = dot(Normal, -Acceleration) > length(Acceleration) * 0.1;
+                if (Motion == 2 && Supported && Rebound < SleepSpeed)
+                {
+                    Rebound = 0;
+                }
+                float NormalSpeedNow = dot(OutVelocity, Normal);
+                float Impulse = max(0, Rebound - NormalSpeedNow);
+                float3 Tangent = OutVelocity - Normal * NormalSpeedNow;
+                Tangent *= max(0, 1 - Friction * Impulse / max(length(Tangent), 0.000001));
+                OutVelocity = Tangent + Normal * max(NormalSpeedNow, Rebound);
+                OutPosition = Probe + Normal * max(0, Radius + 0.1 - Distance) + OutVelocity * ContactTime;
+
+                // 接線方向へ進んだ先の段差にもめり込ませない。
+                Collision.QuerySurface(OutPosition, Distance, Gradient, Valid);
+                if (Valid && Distance < Radius && dot(Gradient, Gradient) > 0.0000001)
+                {
+                    OutPosition += normalize(Gradient) * (Radius - Distance);
+                }
+                bool Slow = Motion == 2 && Supported && Rebound == 0 && length(OutVelocity) < SleepSpeed;
+                if (Slow)
+                {
+                    OutRestTime = length(OldVelocity) < SleepSpeed ? InRestTime + ContactTime : 0;
+                    if (OutRestTime >= SleepDuration)
+                    {
+                        OutSleeping = 1;
+                        OutVelocity = float3(0, 0, 0);
+                    }
+                }
+            }
+            else if (!ReachedEnd)
+            {
+                OutPosition = Probe;
+            }
+        }

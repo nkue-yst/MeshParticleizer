@@ -1,0 +1,27 @@
+# プラグインと公開用の文書を Git の対象にする。
+/*
+!/.gitignore
+!/.gitattributes
+!/LICENSE
+!/README.md
+!/manny-particleize.webp
+!/Plugins/
+
+/Plugins/*
+!/Plugins/MeshParticleizer/
+/Plugins/MeshParticleizer/*
+!/Plugins/MeshParticleizer/MeshParticleizer.uplugin
+!/Plugins/MeshParticleizer/Config/
+!/Plugins/MeshParticleizer/Content/
+!/Plugins/MeshParticleizer/Shaders/
+!/Plugins/MeshParticleizer/Source/
+
+.vs/
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+__pycache__/
+*.sln
+*.slnx
+*.pdb

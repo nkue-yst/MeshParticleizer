@@ -1,0 +1,38 @@
+uint {ParameterName}_Count;
+uint {ParameterName}_Priority;
+float {ParameterName}_StartTime;
+RWBuffer<uint> {ParameterName}_Records;
+
+void UpdateState_{ParameterName}_UEImpureCall(int Index, bool Alive, float Detached, float Sleeping,
+    float Elapsed, out float Fade, out bool StillAlive)
+{
+    Fade = 1;
+    StillAlive = Alive;
+    if (Index < 0 || uint(Index) >= {ParameterName}_Count)
+    {
+        return;
+    }
+
+    uint Offset = uint(Index) * 4;
+    uint OldState = {ParameterName}_Records[Offset];
+    // 返却済みの候補はDIやEmitterの再初期化でも復活させない。
+    StillAlive = Alive && OldState != 0;
+    bool Retiring = OldState == 4;
+    float FadeStart = asfloat({ParameterName}_Records[Offset + 2]);
+    if (Retiring)
+    {
+        Fade = saturate(1 - (Elapsed - FadeStart) / 0.25);
+        StillAlive = StillAlive && Fade > 0;
+    }
+    uint State = !StillAlive ? 0 : Retiring ? 4 : Detached < 0.5 ? 1 : Sleeping > 0.5 ? 3 : 2;
+    if (State == 3 && OldState != 3)
+    {
+        {ParameterName}_Records[Offset + 1] = asuint(max(0, {ParameterName}_StartTime + Elapsed));
+    }
+    {ParameterName}_Records[Offset] = State;
+    if (!Retiring)
+    {
+        {ParameterName}_Records[Offset + 2] = asuint(Elapsed);
+    }
+    {ParameterName}_Records[Offset + 3] = {ParameterName}_Priority;
+}
